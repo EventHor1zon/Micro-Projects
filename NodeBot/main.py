@@ -1,0 +1,3 @@
+import robotmain
+
+robotmain.main()
