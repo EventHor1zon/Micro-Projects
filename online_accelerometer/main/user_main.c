@@ -1,9 +1,19 @@
 /*
- *  Project:    MPU6050 to websocket bump sensor and recorder
+ *  Project:    MPU6050 to tcp/websocket bump sensor and recorder
  *  Date:       30-1-2019
- *  Version:    0.1
+ *  Version:    0.2
  *  Author:     RJM
- *
+ *  Platform:   ESP8266_RTOS_SDK
+ *  IDE:        Atom inc. PlatformIO
+ *  Compiler:   xtensa-lx106-elf
+
+    /*******
+    / Progress so far: Established working mpu6050, read/write i2c, wifi config & tcp connections
+    /                   Succesfully streamed data to server running a crappy python recv. program
+    /
+    / Next up:         Implement functions to take averages/change over time, use LED pwm to fade led based on bumps,
+    /                   Implement a webpage using websockets, display data as real-time graphs.
+    /*********
  */
 
 /* inc standard libraries */
@@ -19,11 +29,13 @@
 #include "freertos/timers.h"
 /* inc ESP specific libraries */
 #include "esp_event_loop.h"
+#include "driver/pwm.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_err.h"
 /* inc esp lwip libraries */
+#include "lwip/api.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -39,8 +51,8 @@
 #define SERVER_ADDR CONFIG_SERVER_ADDR
 #define SERVER_PORT CONFIG_SERVER_PORT
 /* i2c config */
-#define I2C_MASTER_SCL_IO           2                /*!< gpio number for I2C master clock */
-#define I2C_MASTER_SDA_IO           14               /*!< gpio number for I2C master data  */
+#define I2C_MASTER_SCL_IO           4                /*!< gpio number for I2C master clock */
+#define I2C_MASTER_SDA_IO           5               /*!< gpio number for I2C master data  */
 #define I2C_MASTER_NUM              I2C_NUM_0        /*!< I2C port number for master dev */
 #define WRITE_BIT                   I2C_MASTER_WRITE /*!< I2C master write */
 #define READ_BIT                    I2C_MASTER_READ  /*!< I2C master read */
@@ -49,6 +61,8 @@
 #define ACK_VAL                     0x0              /*!< I2C ack value */
 #define NACK_VAL                    0x1              /*!< I2C nack value */
 #define LAST_NACK_VAL               0x2              /*!< I2C last_nack value */
+
+#define LED_PIN                    0
 
 /* MPU6050 addresses*/
 #define MPU6050_SENSOR_ADDR     0x68
@@ -76,13 +90,20 @@
 #define WHO_AM_I                0x75
 
 
-#define DATA_LEN (sizeof(uint16_t)*7 + sizeof(double))
+#define DATA_LEN ((sizeof(uint16_t)*7) + sizeof(float) + (sizeof(uint32_t) * 2))
+
+/*
+ * webpage
+ */
+
+
+
 
 /*
  * function prototypes
  */
 
-
+static esp_err_t pwm_config();  /* begin led pwm_init*/
 static esp_err_t i2c_config();  /* begin & config the i2c peripheral */
 static esp_err_t mpu_config();  /* begin & config the MPU6050 device*/
 static void wifi_config();      /* begin & config the WIFI connection */
@@ -94,6 +115,7 @@ static esp_err_t i2c_write_to_slave(i2c_port_t port, uint8_t device, uint8_t reg
 static esp_err_t i2c_read_from_slave(i2c_port_t port, uint8_t device, uint8_t reg_add, uint8_t *buffer, uint8_t len);
 static void mpu_sample(void *args); /* Task: get values from MPU6050 */
 static void transmit_sample(void *args); /* Task: send samples to server over tcp */
+static uint8_t manage_led(uint32_t delta, int channel)
 //static uint16_t delta(MPU6050 data);
 
 
@@ -105,24 +127,36 @@ static void transmit_sample(void *args); /* Task: send samples to server over tc
  	int16_t Gyroscope_X;     /*!< Gyroscope value X axis */
  	int16_t Gyroscope_Y;     /*!< Gyroscope value Y axis */
  	int16_t Gyroscope_Z;     /*!< Gyroscope value Z axis */
- 	double Temperature;       /*!< Temperature in degrees */
+ 	float Temperature;       /*!< Temperature in degrees */
  } MPU6050;
 
 /* data transfer struct + ID */
 typedef struct {
     MPU6050 data;
     uint16_t id;
-    double timestamp;
-    double delta_t;
+    uint32_t timestamp;
+    uint32_t delta_t;
 } MPU_DATA;
 
-/* Variable declaration */
+typedef struct{
+    int16_t deltaAX;
+    int16_t deltaAY;
+    int16_t deltaAZ;
+    int16_t deltaGX;
+    int16_t deltaGY;
+    int16_t deltaGZ;
+    float deltaTemp;
+    uint32_t deltaTime;
+} MPU_DELTA;
+
+
+/************ Global Variables ********************/
 
 static const char *MAIN_TAG = "main";
 static const char *EVENT_TAG = "[EVENT]";
 static const char *TCP_TAG = "[TCP_SETUP]";
 static const char *DEBUG = "@@@@@";
-static const char *HEARTBEAT = "HB";
+static const char *HEARTBEAT = "HEART";
 
 
 static EventGroupHandle_t wifi_event_group;
@@ -132,101 +166,15 @@ uint8_t CONNECTED_STATUS = 0;
 uint16_t id = 0;
 QueueHandle_t qHandle;
 uint32_t time_now, time_last=0;
+int r_index=0;
+MPU_DATA *results[10];
 
 
-/* Functions */
 
+/********************** Interrupts & Events ******************************/
 
-
-static void tcp_config(){
-    uint32_t event_bits = CONNECTED_BIT;
-    // wait for bit(s) to be set in event group //
-    xEventGroupWaitBits(wifi_event_group, event_bits, false, true, portMAX_DELAY);
-    ESP_LOGI(EVENT_TAG, "GOT IP");
-    //now open a socket on the device and connect to the server //
-    connect_to_server();
-
-}
-
-/* using the damn esp32 sdk again...
-static void timer_config(){
-
-    timer_config_t timer;
-    timer.alarm_en = 0;
-    timer.counter_en = 1;
-    timer.counter_dir = TIMER_COUNT_UP;
-    timer.divider = 128;
-
-    timer_init(TIMER_GROUP_0, TIMER_0, );
-
-}*/
-
-static void check_tcp(){
-
-    int tcp_check = send(sockfd, HEARTBEAT, strlen(HEARTBEAT), 0);
-    if(tcp_check < 0) {
-        close(sockfd);
-        CONNECTED_STATUS = 0;
-        ESP_LOGI(TCP_TAG, "Restarting TCP socket.\n");
-        connect_to_server();
-    }
-}
-
-
-static void connect_to_server(){
-
-    int addr_family = AF_INET;
-    int ip_protocol = IPPROTO_IP;
-
-    struct sockaddr_in target;
-    target.sin_addr.s_addr = inet_addr(SERVER_ADDR);
-    target.sin_family = AF_INET;
-    target.sin_port = htons(SERVER_PORT);
-
-    /* create socket file descriptor */
-    sockfd = socket(addr_family, SOCK_STREAM, ip_protocol);
-    if(sockfd < 0) {
-        ESP_LOGI(TCP_TAG, "Unable to create socket" ); }
-    else {
-        ESP_LOGI(TCP_TAG, "Socket created!\n"); }
-
-    /* connect to the server */
-    int err = connect(sockfd, (struct sockaddr *)&target, sizeof(target));
-    if(err != 0) {
-        ESP_LOGI(TCP_TAG, "Error in connecting to socket...\n"); }
-    else {
-        ESP_LOGI(TCP_TAG, "Connected to socket\n");
-        CONNECTED_STATUS = 1; }
-
-}
-
-
-static void wifi_config(){
-
-        tcpip_adapter_init();
-        /* event group to track wifi events */
-        wifi_event_group = xEventGroupCreate();
-        ESP_ERROR_CHECK( esp_event_loop_init(wifi_event_handler, NULL));
-        /* initialise wifi as wifi default */
-        wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
-        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-        ESP_LOGI(EVENT_TAG, "Connecting to AP...");
-        /* Wifi config details */
-        wifi_config_t wifi_config= {
-                .sta = { .ssid = WIFI_SSID,
-                         .password = WIFI_PASS, },
-        };
-        /* config and start wifi */
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA,  &wifi_config));
-        ESP_LOGI(EVENT_TAG, "Starting Wifi interface");
-        ESP_ERROR_CHECK(esp_wifi_start());
-}
-
-
-static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
-{
+// wifi events handles connection/disconnection events
+static esp_err_t wifi_event_handler(void *ctx, system_event_t *event){
     /* callback to switch handle wifi events */
     switch(event->event_id) {
     case SYSTEM_EVENT_STA_START:
@@ -252,6 +200,44 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
     return ESP_OK;
 }
 
+/********************** Config & Startup *********************************/
+
+// config & init the wifi connection
+static void wifi_config(){
+
+        tcpip_adapter_init();
+        /* event group to track wifi events */
+        wifi_event_group = xEventGroupCreate();
+        ESP_ERROR_CHECK( esp_event_loop_init(wifi_event_handler, NULL));
+        /* initialise wifi as wifi default */
+        wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+        ESP_LOGI(EVENT_TAG, "Connecting to AP...");
+        /* Wifi config details */
+        wifi_config_t wifi_config= {
+                .sta = { .ssid = WIFI_SSID,
+                         .password = WIFI_PASS, },
+        };
+        /* config and start wifi */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA,  &wifi_config));
+        ESP_LOGI(EVENT_TAG, "Starting Wifi interface");
+        ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// config & init the TCP connection to server
+static void tcp_config(){
+    uint32_t event_bits = CONNECTED_BIT;
+    // wait for bit(s) to be set in event group //
+    xEventGroupWaitBits(wifi_event_group, event_bits, false, true, portMAX_DELAY);
+    ESP_LOGI(EVENT_TAG, "GOT IP");
+    //now open a socket on the device and connect to the server //
+    connect_to_server();
+
+}
+
+// config & init the MPU6050 accelerometer
 static esp_err_t mpu_config(){
     /* configure the MPU6050 settings, see below for details */
     uint8_t command;
@@ -270,13 +256,14 @@ static esp_err_t mpu_config(){
     return ESP_OK;
 }
 
+// configure the i2c driver
 static esp_err_t i2c_config(){
     /* configure I2C as master */
 
      i2c_config_t config;
      config.mode = I2C_MODE_MASTER;
-     config.sda_io_num = GPIO_NUM_14;
-     config.scl_io_num = GPIO_NUM_2;
+     config.sda_io_num = I2C_MASTER_SDA_IO;
+     config.scl_io_num = I2C_MASTER_SCL_IO;
      config.sda_pullup_en = 0;
      config.scl_pullup_en = 0;
      ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, config.mode));
@@ -286,6 +273,21 @@ static esp_err_t i2c_config(){
 
  }
 
+// configure the pwm driver for leds
+static esp_err_t pwm_config(){
+     // ok an actual control over the led pwm...
+     // 5kHz, duty=0, pwm__channel=1, pin_num = 0
+     uint32_t pin=LED_PIN;
+     if(pwm_init(5000, 0, 1, 0) != ESP_OK) { ESP_LOGE(MAIN_TAG, "Error in intialising pwm\n"); }
+     if(pwm_start() != ESP_OK) { ESP_LOGE(MAIN_TAG, "Error in starting pwm\n"); }
+     return;
+
+ }
+
+
+/********************** I2C core functions ******************************/
+
+/// writes data to slave
 static esp_err_t i2c_write_to_slave(i2c_port_t port, uint8_t device, uint8_t reg_addr, uint8_t *data, size_t data_len) {
     /* Write data to slave over I2C */
 
@@ -303,6 +305,7 @@ static esp_err_t i2c_write_to_slave(i2c_port_t port, uint8_t device, uint8_t reg
     return ret;
 }
 
+// reads data from slave
 static esp_err_t i2c_read_from_slave(i2c_port_t port, uint8_t device, uint8_t reg_addr, uint8_t *buffer, uint8_t len){
     /* Read data from slave over I2C */
 
@@ -324,6 +327,9 @@ static esp_err_t i2c_read_from_slave(i2c_port_t port, uint8_t device, uint8_t re
 }
 
 
+/********************* Application Tasks *******************************/
+
+// samples from the MCU and logs data/sends to send q
 static void mpu_sample(void *args){
     /* read data from accelerometer */
     uint8_t sensor_data[14];
@@ -332,7 +338,7 @@ static void mpu_sample(void *args){
 
     while (1) {
         /* loop forever */
-        if(uxQueueMessagesWaiting(qHandle)) { vTaskDelay(100/portTICK_PERIOD_MS); }
+        if(uxQueueMessagesWaiting(qHandle)) { vTaskDelay(30/portTICK_PERIOD_MS); }
         else{
             memset(sensor_data, 0, 14);
             esp_err_t ret = i2c_read_from_slave(I2C_NUM_0, MPU6050_SENSOR_ADDR, ACCEL_XOUT_H, sensor_data, 14);
@@ -340,20 +346,25 @@ static void mpu_sample(void *args){
             /* increment id number */
             id++;
             /* fill data struct with data */
-            mpu.Accelerometer_X = (uint16_t) sensor_data[0] << 8| sensor_data[1];
-            mpu.Accelerometer_Y = (uint16_t) sensor_data[2] << 8| sensor_data[3];
-            mpu.Accelerometer_Z = (uint16_t) sensor_data[4] << 8| sensor_data[5];
+            mpu.Accelerometer_X = (int16_t) sensor_data[0] << 8| sensor_data[1];
+            mpu.Accelerometer_Y = (int16_t) sensor_data[2] << 8| sensor_data[3];
+            mpu.Accelerometer_Z = (int16_t) sensor_data[4] << 8| sensor_data[5];
             mpu.Temperature = 36.53 + ((double)(int16_t)((sensor_data[6] << 8) | sensor_data[7]) / 340);  // check this... double or float????
-            mpu.Gyroscope_X = (uint16_t) sensor_data[8] << 8| sensor_data[9];
-            mpu.Gyroscope_Y = (uint16_t) sensor_data[10] << 8| sensor_data[11];
-            mpu.Gyroscope_Z = (uint16_t) sensor_data[12] << 8| sensor_data[13];
+            mpu.Gyroscope_X = (int16_t) sensor_data[8] << 8| sensor_data[9];
+            mpu.Gyroscope_Y = (int16_t) sensor_data[10] << 8| sensor_data[11];
+            mpu.Gyroscope_Z = (int16_t) sensor_data[12] << 8| sensor_data[13];
             /* log data to console */
             ESP_LOGI(MAIN_TAG, "Accel X: %d\tAccel Y: %d\tAccel Z: %d\tGyros X: %d\tGyros Y: %d\tGyros Z: %d", mpu.Accelerometer_X, mpu.Accelerometer_Y, mpu.Accelerometer_Z, mpu.Gyroscope_X,mpu.Gyroscope_Y, mpu.Gyroscope_Z);
+            char *tempstring[10];
+            sprintf(tempstring, );
+            /* problems with printing floats - remember some specific flags from stm32, could be the same?
+            //ESP_LOGI(MAIN_TAG, "Temp: %f\n", mpu.Temperature);
+            //ESP_LOGI(MAIN_TAG, "size of float: %d\t size of double: %d", sizeof(float), sizeof(double));
             } else {
                 ESP_LOGI(MAIN_TAG, "Error in reading from MPU\n");
             }
             /*  build data to send to queue - maybe redundant to do both mpu and mpu_data */
-            time_now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            time_now = xTaskGetTickCount() / portTICK_PERIOD_MS;
             data.data = mpu;
             data.id = id;
             /* make a timestamp and delta t for change over time */
@@ -363,12 +374,43 @@ static void mpu_sample(void *args){
             /* send data to queue - block until last data is sent */
             xQueueSendToBack(qHandle, (void *)&data, portMAX_DELAY);
             }
+        }
     }
-
     i2c_driver_delete(I2C_MASTER_NUM);
 }
 
+// adjusts the LED brightness
+static uint8_t manage_led(void *args){
 
+    MPU_DELTA delta = (MPU_DELTA *)args;
+    uint32_t max_duty=5000, duty;
+    bool direction = 1;
+
+    while(1){
+        if(CONNECTED_STATUS == 0){
+        // while connecting, do fairly quick fade-in/out
+            if(get_pwm(1, &duty) != ESP_OK) { ESP_LOGE(MAIN_TAG, "Error in changing pwm...\n"); }
+            if(direction && duty < max_duty){ pwm_set_duty(1, (duty+=50)); }
+            else if(!(direction) && duty > 0){ pwm_set_duty(1, (duty-=50)); }
+            else { direction=!direction; }
+        }
+        else(){
+        // else connected,
+            get_pwm(channel, &duty);
+            if(delta == 0){ // no bump recently
+                if(duty > 0) { pwm_set_duty(1, (duty-=5)); }
+            }
+            else{           // bumpies!
+                /* figure out a good way of setting pwm based on intensity of change */
+            }
+
+        }
+
+    }
+
+}
+
+// transmits collected data over tcp to server
 static void transmit_sample(void *args){
     /* send data from struct over TCP to server */
     void *payload;
@@ -379,7 +421,7 @@ static void transmit_sample(void *args){
         /* loop forever */
         /* wait on data from queue */
         if(!(uxQueueMessagesWaiting(qHandle)) || !CONNECTED_STATUS){
-             vTaskDelay(100/portTICK_PERIOD_MS); }
+             vTaskDelay(30/portTICK_PERIOD_MS); }
         else{
             xQueueReceive(qHandle, (void *)&data, portMAX_DELAY);
             payload = &data;
@@ -410,9 +452,128 @@ static void transmit_sample(void *args){
 }
 
 
+/********************* Utility Functions *******************************/
+
+// appends newest results to list
+static void append_to_results(MPU_DATA *data){
+
+    if(r_index < 10){
+        results[r_index] = data;
+        r_index++;
+    }
+    else{
+        results[r_index] = data;
+        r_index = 0;
+    }
+}
+
+// finds change in measurements over time
+static void get_delta(void *args){
+    /*typedef struct {
+        MPU6050 data;
+        uint16_t id;
+        uint32_t timestamp;
+        uint32_t delta_t;
+    } MPU_DATA;*/
+
+    MPU_DELTA delta;
+
+    if(r_index > 0){
+        delta.deltaAX = results[r_index-1]->data.Accelerometer_X - results[r_index]->data.Accelerometer_X;
+        delta.deltaAZ = results[r_index-1]->data.Accelerometer_Z - results[r_index]->data.Accelerometer_Z;
+        delta.deltaAY = results[r_index-1]->data.Accelerometer_Y - results[r_index]->data.Accelerometer_Y;
+        delta.deltaGX = results[r_index-1]->data.Gyroscope_X - results[r_index]->data.Gyroscope_X;
+        delta.deltaGX = results[r_index-1]->data.Gyroscope_Y - results[r_index]->data.Gyroscope_Y;
+        delta.deltaGX = results[r_index-1]->data.Gyroscope_Z - results[r_index]->data.Gyroscope_Z;
+        delta.deltaTemp = results[r_index-1]->data.Temperature - results[r_index]->data.Temperature;
+        delta.deltaTime = results[r_index-1]->delta_t;
+    } else {
+        // r_index = 0 so last reading is readings[10]
+        delta.deltaAX = results[10]->data.Accelerometer_X - results[r_index]->data.Accelerometer_X;
+        delta.deltaAZ = results[10]->data.Accelerometer_Z - results[r_index]->data.Accelerometer_Z;
+        delta.deltaAY = results[10]->data.Accelerometer_Y - results[r_index]->data.Accelerometer_Y;
+        delta.deltaGX = results[10]->data.Gyroscope_X - results[r_index]->data.Gyroscope_X;
+        delta.deltaGX = results[10]->data.Gyroscope_Y - results[r_index]->data.Gyroscope_Y;
+        delta.deltaGX = results[10]->data.Gyroscope_Z - results[r_index]->data.Gyroscope_Z;
+        delta.deltaTemp = results[10]->data.Temperature - results[r_index]->data.Temperature;
+        delta.deltaTime = results[10]->delta_t;
+    }
+
+    uint32_t a_delta = delta.deltaAX + delta.deltaAY + delta.deltaAZ;
+    uint32_t g_delta = delta.deltaGX + delta.deltaGY + delta.deltaGZ
+    if(a_delta > THRESHOLD) { manage_led(a_delta, 1); }
+
+}
+
+// checks the tcp connection using heartbeat packet
+static void check_tcp(){
+        /* TCP heartbeat function */
+
+    char rx_buffer[12];
+    char *needle = "BEAT";
+
+    int tcp_check = send(sockfd, HEARTBEAT, strlen(HEARTBEAT), 0);
+    if(tcp_check < 0) {
+        close(sockfd);
+        CONNECTED_STATUS = 0;
+        ESP_LOGI(TCP_TAG, "Restarting TCP socket.\n");
+        connect_to_server();
+    }
+    int rec = recv(sockfd, rx_buffer, sizeof(rx_buffer), NULL);
+    if(strstr(rx_buffer, needle) != NULL){
+        ESP_LOGI(TCP_TAG, "Heartbeat succesful\n");
+    }
+}
+
+// connects to the configured server
+static void connect_to_server(){
+
+    int addr_family = AF_INET;
+    int ip_protocol = IPPROTO_IP;
+
+    struct sockaddr_in target;
+    target.sin_addr.s_addr = inet_addr(SERVER_ADDR);
+    target.sin_family = AF_INET;
+    target.sin_port = htons(SERVER_PORT);
+
+    /* create socket file descriptor */
+    sockfd = socket(addr_family, SOCK_STREAM, ip_protocol);
+    if(sockfd < 0) {
+        ESP_LOGI(TCP_TAG, "Unable to create socket" ); }
+    else {
+        ESP_LOGI(TCP_TAG, "Socket created!\n"); }
+
+    /* connect to the server */
+    int err = connect(sockfd, (struct sockaddr *)&target, sizeof(target));
+    if(err != 0) {
+        ESP_LOGI(TCP_TAG, "Error in connecting to socket...\n"); }
+    else {
+        ESP_LOGI(TCP_TAG, "Connected to socket\n");
+        CONNECTED_STATUS = 1; }
+
+}
+
+
+/****************************** WebSocket *********************************/
+/**
+Attempt at websocket server
+see (http://www.barth-dev.de/websockets-on-the-esp32/)
+**/
+
+QueueHandle_t WS_Queue;
+
+
+void ws_server(void *args){
+
+
+
+}
+
+/**************************** APP MAIN ************************************/
+
 void app_main(void){
 
-
+    pwm_config();
     i2c_config();
     mpu_config();
     wifi_config();
@@ -421,6 +582,7 @@ void app_main(void){
     qHandle = xQueueCreate(1, sizeof(MPU_DATA));
     if(qHandle != NULL){
         /* create tasks to run */
+        xTaskCreate(manage_led, "ledc", 5012, NULL, 1, NULL);
         xTaskCreate(transmit_sample, "transmit", 5012, NULL, 2, NULL);
         xTaskCreate(mpu_sample, "sample", 5012, NULL, 2, NULL);
     }
