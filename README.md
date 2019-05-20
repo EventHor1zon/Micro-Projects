@@ -1,5 +1,11 @@
-Storage place for small mcu projects. Nothing too complicated in here, mostly learning ground.
+Storage place for mcu projects. Part Dev, part Learning area
 
 Frameworks: STM32 HAL
+
             ESP-IDF w. FreeRTOS
-            ESP8266 SDK
+
+            ESP8266_RTOS_SDK
+            
+            MicroPython
+            
+            
