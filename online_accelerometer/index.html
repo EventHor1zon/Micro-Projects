@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link href='https://fonts.googleapis.com/css?family=Audiowide' rel='stylesheet'>
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <meta charset="utf-8">
+
+    <script type="text/javascript" src="http://smoothiecharts.org/smoothie.js"></script>
+
+    <script>
+
+        var aX = new TimeSeries();
+        var aY = new TimeSeries();
+        var aZ = new TimeSeries();
+        var t = new Date();
+        function graph_it(results) {
+
+            aX.append(new Date().getTime(), results.aX);
+            aY.append(new Date().getTime(), results.aY);
+            aZ.append(new Date().getTime(), results.aZ);
+        }
+
+        function init() {
+
+            var chart = new SmoothieChart({millisPerPixel:45,scaleSmoothing:0.292,grid:{strokeStyle:'#9a85b6',millisPerLine:2000,verticalSections:7},labels:{fillStyle:'#ff5858'},maxValue:14000,minValue:-14000});
+            chart.addTimeSeries(aX, {lineWidth:1.3,strokeStyle:'#00ff00'});
+            chart.addTimeSeries(aY, {lineWidth:1.3,strokeStyle:'#ff0000'});
+            chart.addTimeSeries(aZ, {lineWidth:1.3,strokeStyle:'#0000ff'});
+
+            chart.streamTo(document.getElementById("mychart"), 0);
+
+        }
+
+        ip=location.host;
+        console.log(ip);
+        ws = new WebSocket("ws://"+ip);
+
+        ws.onopen = function() {
+            console.log("Websocket opened...");
+            ws.send("Message");
+            request_interval = window.setInterval(requestData, 10);
+        }
+
+        ws.addEventListener('message', function(evt){
+            var recvd = evt.data;
+            console.log(evt.data);
+            recv =JSON.parse(evt.data);
+            graph_it(recv);
+        });
+
+    </script>
+
+    <style>
+        body {
+            font-family: 'Audiowide';font-size: 22px;
+        }
+    </style>
+    <title> NodeServer MPU6050 </title>
+
+</head>
+
+<body style="background-image:url(./background.jpg)" onload="init()">
+    <h3> NodeServer Accelerometer Display </h3>
+    <p> Accelerometer / Gyroscope Realtime Display </p>
+    <form action= >
+        <input type="radio" name="setting" value="A" checked> Accelerometer <br>
+        <input type="radio" name="setting" value="G"> Gyroscope <br>
+    </form>
+
+    <canvas id="mychart" width="702" height="275" style="border:2px solid #000000;"> </canvas>
+</body>
+
+</html>
